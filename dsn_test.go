@@ -56,6 +56,16 @@ func TestRedshiftDataConfig__String(t *testing.T) {
 			expected: "admin@cluster(default)/dev?extra=hoge",
 		},
 		{
+			dsn: &RedshiftDataConfig{
+				ClusterIdentifier: aws.String("default"),
+				DbUser:            aws.String("admin"),
+				Database:          aws.String("dev"),
+				Schema:            "public",
+				Params:            url.Values{},
+			},
+			expected: "admin@cluster(default)/dev?search_path=public",
+		},
+		{
 			dsn: (&RedshiftDataConfig{
 				ClusterIdentifier: aws.String("default"),
 				DbUser:            aws.String("admin"),

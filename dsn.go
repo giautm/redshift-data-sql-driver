@@ -20,6 +20,9 @@ type RedshiftDataConfig struct {
 
 	Timeout time.Duration
 	Polling time.Duration
+	// With schema defined, the driver will execute "SET search_path TO [schema_name];"
+	// in same transaction with the query.
+	Schema string
 
 	Params             url.Values
 	RedshiftDataOptFns []func(*redshiftdata.Options)
@@ -43,6 +46,11 @@ func (cfg *RedshiftDataConfig) String() string {
 		params.Add("polling", cfg.Polling.String())
 	} else {
 		params.Del("polling")
+	}
+	if cfg.Schema != "" {
+		params.Add("search_path", cfg.Schema)
+	} else {
+		params.Del("search_path")
 	}
 	encodedParams := params.Encode()
 	if encodedParams != "" {
@@ -73,6 +81,10 @@ func (cfg *RedshiftDataConfig) setParams(params url.Values) error {
 	}
 	if len(cfg.Params) == 0 {
 		cfg.Params = nil
+	}
+	if params.Has("search_path") {
+		cfg.Schema = params.Get("search_path")
+		cfg.Params.Del("search_path")
 	}
 	return nil
 }
