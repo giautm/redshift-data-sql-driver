@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -55,6 +56,11 @@ func (conn *redshiftDataConn) BeginTx(ctx context.Context, opts driver.TxOptions
 	}
 	if opts.Isolation != driver.IsolationLevel(sql.LevelDefault) {
 		return nil, fmt.Errorf("transaction isolation level change: %w", ErrNotSupported)
+	}
+	// if schema is set then append stmt "SET search_path TO [schema_name];"
+	// at the beginning of the transaction
+	if conn.cfg.Schema != "" {
+		conn.sqls = append(conn.sqls, changeSchemaStmt(conn.cfg.Schema))
 	}
 	conn.inTx = true
 	conn.txOpts = opts
@@ -121,17 +127,22 @@ func (conn *redshiftDataConn) QueryContext(ctx context.Context, query string, ar
 	if conn.inTx {
 		return nil, fmt.Errorf("query in transaction: %w", ErrNotSupported)
 	}
-
-	params := &redshiftdata.ExecuteStatementInput{
+	input := &redshiftdata.ExecuteStatementInput{
 		Sql:        nullif(rewriteQuery(query, len(args))),
 		Parameters: convertArgsToParameters(args),
 	}
-	p, output, err := conn.executeStatement(ctx, params)
+	if conn.cfg.Schema != "" {
+		p, output, err := conn.executeStatementWithSchema(ctx, conn.cfg.Schema, input)
+		if err != nil {
+			return nil, err
+		}
+		return newRows(coalesce(output.Id), p), nil
+	}
+	p, output, err := conn.executeStatement(ctx, input)
 	if err != nil {
 		return nil, err
 	}
-	rows := newRows(coalesce(output.Id), p)
-	return rows, nil
+	return newRows(coalesce(output.Id), p), nil
 }
 
 func (conn *redshiftDataConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -148,16 +159,41 @@ func (conn *redshiftDataConn) ExecContext(ctx context.Context, query string, arg
 		debugLogger.Printf("delayedResult[%d] creaed for %q", len(conn.delayedResult)-1, query)
 		return result, nil
 	}
-
 	params := &redshiftdata.ExecuteStatementInput{
 		Sql:        nullif(rewriteQuery(query, len(args))),
 		Parameters: convertArgsToParameters(args),
+	}
+	if conn.cfg.Schema != "" {
+		_, output, err := conn.executeStatementWithSchema(ctx, conn.cfg.Schema, params)
+		if err != nil {
+			return nil, err
+		}
+		return newResult(output), nil
 	}
 	_, output, err := conn.executeStatement(ctx, params)
 	if err != nil {
 		return nil, err
 	}
 	return newResult(output), nil
+}
+
+// executeStatementWithSchema changes the schema context and executes the statement.
+func (conn *redshiftDataConn) executeStatementWithSchema(
+	ctx context.Context,
+	schema string,
+	input *redshiftdata.ExecuteStatementInput,
+) (*redshiftdata.GetStatementResultPaginator, *redshiftdata.DescribeStatementOutput, error) {
+	batch := &redshiftdata.BatchExecuteStatementInput{
+		Sqls: []string{changeSchemaStmt(schema), prepareStatement(*input)},
+	}
+	ps, output, err := conn.batchExecuteStatement(ctx, batch)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(ps) != 2 {
+		return nil, nil, fmt.Errorf("unexpected paginator length: %d", len(ps))
+	}
+	return ps[1], output, nil
 }
 
 func rewriteQuery(query string, paramsCount int) string {
@@ -206,6 +242,24 @@ func convertArgsToParameters(args []driver.NamedValue) []types.SqlParameter {
 		})
 	}
 	return params
+}
+
+// changeSchemaStmt returns a statement to change the schema.
+func changeSchemaStmt(schema string) string {
+	return fmt.Sprintf("SET search_path TO %s;", schema)
+}
+
+// prepareStatement returns a statement prepared for execution.
+// This function will replace the placeholders with the actual parameter names
+func prepareStatement(input redshiftdata.ExecuteStatementInput) string {
+	sql := *input.Sql
+	if input.Parameters == nil || len(input.Parameters) == 0 {
+		return sql
+	}
+	for _, param := range input.Parameters {
+		sql = strings.ReplaceAll(sql, fmt.Sprintf(":%s", *param.Name), fmt.Sprintf("'%v'", *param.Value))
+	}
+	return sql
 }
 
 func (conn *redshiftDataConn) executeStatement(ctx context.Context, params *redshiftdata.ExecuteStatementInput) (*redshiftdata.GetStatementResultPaginator, *redshiftdata.DescribeStatementOutput, error) {
@@ -275,9 +329,6 @@ func (conn *redshiftDataConn) batchExecuteStatement(ctx context.Context, params 
 	debugLogger.Printf("[%s] success query: elapsed_time=%s", *batchExecuteOutput.Id, time.Since(queryStart))
 	ps := make([]*redshiftdata.GetStatementResultPaginator, len(params.Sqls))
 	for i, st := range describeOutput.SubStatements {
-		if *st.HasResultSet {
-			continue
-		}
 		ps[i] = redshiftdata.NewGetStatementResultPaginator(conn.client, &redshiftdata.GetStatementResultInput{
 			Id: st.Id,
 		})
