@@ -6,8 +6,10 @@ import (
 	"database/sql/driver"
 )
 
+const DriverName = "redshift-data"
+
 func init() {
-	sql.Register("redshift-data", &redshiftDataDriver{})
+	sql.Register(DriverName, &redshiftDataDriver{})
 }
 
 type redshiftDataDriver struct{}
