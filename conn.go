@@ -227,9 +227,17 @@ func convertArgsToParameters(args []driver.NamedValue) []types.SqlParameter {
 	}
 	params := make([]types.SqlParameter, 0, len(args))
 	for _, arg := range args {
+		value := aws.String(fmt.Sprintf("%v", arg.Value))
+		switch t := arg.Value.(type) {
+		case time.Time:
+			// if arg is time.Time, format to RFC3339
+			value = aws.String(t.Format(time.RFC3339))
+		case *time.Time:
+			value = aws.String(t.Format(time.RFC3339))
+		}
 		params = append(params, types.SqlParameter{
 			Name:  aws.String(coalesce(nullif(arg.Name), aws.String(fmt.Sprintf("%d", arg.Ordinal)))),
-			Value: aws.String(fmt.Sprintf("%v", arg.Value)),
+			Value: value,
 		})
 	}
 	return params
