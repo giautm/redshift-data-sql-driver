@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -118,7 +120,7 @@ func (conn *redshiftDataConn) Begin() (driver.Tx, error) {
 }
 
 func (conn *redshiftDataConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if conn.inTx {
+	if conn.inTx && len(conn.sqls) > 0 {
 		return nil, fmt.Errorf("query in transaction: %w", ErrNotSupported)
 	}
 
@@ -137,7 +139,10 @@ func (conn *redshiftDataConn) QueryContext(ctx context.Context, query string, ar
 func (conn *redshiftDataConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if conn.inTx {
 		if len(args) > 0 {
-			return nil, fmt.Errorf("exec with args in transaction: %w", ErrNotSupported)
+			query = prepareStatement(redshiftdata.ExecuteStatementInput{
+				Sql:        nullif(rewriteQuery(query, len(args))),
+				Parameters: convertArgsToParameters(args),
+			})
 		}
 		if conn.txOpts.ReadOnly {
 			return nil, fmt.Errorf("exec in read only transaction: %w", ErrNotSupported)
@@ -158,6 +163,28 @@ func (conn *redshiftDataConn) ExecContext(ctx context.Context, query string, arg
 		return nil, err
 	}
 	return newResult(output), nil
+}
+
+// prepareStatement returns a statement prepared for execution.
+// This function will replace the placeholders with the actual parameter names
+func prepareStatement(input redshiftdata.ExecuteStatementInput) string {
+	sql := *input.Sql
+	if input.Parameters == nil || len(input.Parameters) == 0 {
+		return sql
+	}
+	for _, param := range input.Parameters {
+		sql = mapParam(sql, param)
+	}
+	return sql
+}
+
+// mapParam replaces the positional parameter with the actual value
+func mapParam(sql string, param types.SqlParameter) string {
+	v := strings.ReplaceAll(*param.Value, "'", "''")
+	// replace the placeholder with the actual value
+	paramReg := regexp.MustCompile(fmt.Sprintf(`:%s\b`, *param.Name))
+	sql = paramReg.ReplaceAllString(sql, fmt.Sprintf("'%v'", v))
+	return sql
 }
 
 func rewriteQuery(query string, paramsCount int) string {
@@ -216,6 +243,18 @@ func (conn *redshiftDataConn) executeStatement(ctx context.Context, params *reds
 	params.WorkgroupName = conn.cfg.WorkgroupName
 	params.SecretArn = conn.cfg.SecretsARN
 
+	// map params to sql if there are null values
+	// the reason is that redshift data api does not support null values
+	// and it will throw an validation error
+	var ps []types.SqlParameter
+	for _, param := range params.Parameters {
+		if param.Value == nil || *param.Value == "" {
+			*params.Sql = mapParam(*params.Sql, param)
+			continue
+		}
+		ps = append(ps, param)
+	}
+	params.Parameters = ps
 	executeOutput, err := conn.client.ExecuteStatement(ctx, params)
 	if err != nil {
 		return nil, nil, fmt.Errorf("execute statement:%w", err)
